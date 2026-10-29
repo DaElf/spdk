@@ -857,7 +857,9 @@ posix_ssl_get_error(SSL *ssl, int rc)
 	case SSL_ERROR_ZERO_RETURN:
 		return 0;
 	case SSL_ERROR_SYSCALL:
-		if (errno != 0) {
+		/* errno is only meaningful if the failed call set it (callers zero it first).
+		 * Never report a fatal SYSCALL error as retryable. */
+		if (errno != 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
 			return -errno;
 		}
 		return -ECONNRESET;
@@ -877,11 +879,19 @@ posix_ssl_readv(struct spdk_posix_sock *sock, const struct iovec *iov, int iovcn
 	ssize_t total = 0;
 	int ssl_err;
 
+	/* OpenSSL keeps one error queue per thread, and SSL_get_error() returns SSL_ERROR_SSL
+	 * whenever it is non-empty. A failed handshake on another connection of this reactor
+	 * (e.g. a client that connects and closes without TLS) leaves an error there, which
+	 * would turn this connection's WANT_READ/WANT_WRITE into a fatal error. SSL_get_error(3)
+	 * requires the queue to be empty before the I/O call. */
+	ERR_clear_error();
+
 	for (i = 0; i < iovcnt; i++) {
 		char *base = (char *)iov[i].iov_base;
 		size_t len = iov[i].iov_len;
 
 		while (len > 0) {
+			errno = 0;
 			rc = SSL_read(ssl, base, len);
 			if (rc > 0) {
 				total += rc;
@@ -895,7 +905,9 @@ posix_ssl_readv(struct spdk_posix_sock *sock, const struct iovec *iov, int iovcn
 				break;
 			}
 		}
-		if (rc <= 0) {
+		/* Stop at the first short read: the caller treats the result as one contiguous
+		 * run, so data must not land in iov[i + 1] while iov[i] is only partly filled. */
+		if (rc <= 0 || len > 0) {
 			break;
 		}
 	}
@@ -920,7 +932,12 @@ posix_ssl_writev(SSL *ssl, struct iovec *iov, int iovcnt)
 	int i, rc = 0;
 	ssize_t total = 0;
 
+	/* See posix_ssl_readv(): a stale error on this thread's queue would make a normal
+	 * partial write (WANT_WRITE) look fatal and abort the rest of the queued PDU. */
+	ERR_clear_error();
+
 	for (i = 0; i < iovcnt; i++) {
+		errno = 0;
 		rc = SSL_write(ssl, iov[i].iov_base, iov[i].iov_len);
 
 		if (rc > 0) {
@@ -1243,25 +1260,13 @@ posix_sock_close(struct spdk_sock *_sock)
 	sock_posix_connect_ctx_cleanup(&sock->connect_ctx, -ECONNRESET);
 
 	if (sock->ssl != NULL) {
+		/* Best-effort close_notify. Don't retry or poll here: this runs on the reactor
+		 * thread, and the fd is closed right after anyway. */
 		if (!SSL_in_init(sock->ssl)) {
-			int retries = 0;
-			int rc;
-
-			while (retries++ < 5) {
-				rc = SSL_shutdown(sock->ssl);
-				if (rc >= 0) {
-					break;
-				}
-				int err = SSL_get_error(sock->ssl, rc);
-				if (err != SSL_ERROR_WANT_WRITE && err != SSL_ERROR_WANT_READ) {
-					break;
-				}
-				struct pollfd pfd = { .fd = sock->fd, .events = POLLOUT };
-				if (poll(&pfd, 1, 1) <= 0) {
-					break;
-				}
-			}
+			ERR_clear_error();
+			SSL_shutdown(sock->ssl);
 		}
+		/* Don't leave this connection's errors on the thread's queue for the next one. */
 		ERR_clear_error();
 	}
 
