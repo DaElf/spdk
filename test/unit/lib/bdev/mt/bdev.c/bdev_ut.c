@@ -1006,6 +1006,8 @@ basic_qos(void)
 	bdev = &g_bdev.bdev;
 	bdev->internal.qos = calloc(1, sizeof(*bdev->internal.qos));
 	SPDK_CU_ASSERT_FATAL(bdev->internal.qos != NULL);
+	/* What spdk_bdev_set_qos_rate_limits() sets; 0 makes the timeslice loop spin. */
+	bdev->internal.qos->timeslice_in_usecs = SPDK_BDEV_QOS_TIMESLICE_IN_USEC;
 	/*
 	 * Enable read/write IOPS, read only byte per second and
 	 * read/write byte per second rate limits.
@@ -1180,6 +1182,8 @@ io_during_qos_queue(void)
 	bdev = &g_bdev.bdev;
 	bdev->internal.qos = calloc(1, sizeof(*bdev->internal.qos));
 	SPDK_CU_ASSERT_FATAL(bdev->internal.qos != NULL);
+	/* What spdk_bdev_set_qos_rate_limits() sets; 0 makes the timeslice loop spin. */
+	bdev->internal.qos->timeslice_in_usecs = SPDK_BDEV_QOS_TIMESLICE_IN_USEC;
 
 	/*
 	 * Enable read/write IOPS, read only byte per sec, write only
@@ -1283,6 +1287,8 @@ io_during_qos_reset(void)
 	bdev = &g_bdev.bdev;
 	bdev->internal.qos = calloc(1, sizeof(*bdev->internal.qos));
 	SPDK_CU_ASSERT_FATAL(bdev->internal.qos != NULL);
+	/* What spdk_bdev_set_qos_rate_limits() sets; 0 makes the timeslice loop spin. */
+	bdev->internal.qos->timeslice_in_usecs = SPDK_BDEV_QOS_TIMESLICE_IN_USEC;
 
 	/*
 	 * Enable read/write IOPS, write only byte per sec and
@@ -2885,7 +2891,7 @@ qos_bdev_open_close_data_race(void)
 	SPDK_CU_ASSERT_FATAL(desc != NULL);
 	done = false;
 
-	spdk_bdev_set_qos_rate_limits(&g_bdev.bdev, limits, qos_dynamic_enable_done, &rc);
+	spdk_bdev_set_qos_rate_limits(&g_bdev.bdev, limits, 0, qos_dynamic_enable_done, &rc);
 	poll_threads();
 
 	set_thread(1);
@@ -2950,7 +2956,7 @@ bdev_unregister_open_qos_data_race(void)
 
 	set_thread(0);
 	/* Enable qos, so bdev_open() will call it later. */
-	spdk_bdev_set_qos_rate_limits(&g_bdev.bdev, limits, qos_dynamic_enable_done, &rc);
+	spdk_bdev_set_qos_rate_limits(&g_bdev.bdev, limits, 0, qos_dynamic_enable_done, &rc);
 	poll_threads();
 	set_thread(2);
 	spdk_put_io_channel(io_ch);
