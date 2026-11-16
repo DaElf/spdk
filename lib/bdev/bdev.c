@@ -4224,9 +4224,23 @@ bdev_channel_submit_qos_io(struct spdk_bdev_channel_iter *i, struct spdk_bdev *b
 {
 	struct spdk_bdev_channel *bdev_ch = __io_ch_to_bdev_ch(io_ch);
 	struct spdk_bdev_qos *qos = bdev->internal.qos;
-	uint32_t pos = qos->iter_pos++;
-	bool in_pass = qos->iter_pass == 0 ? pos >= qos->rr_start : pos < qos->rr_start;
+	uint32_t pos;
+	bool in_pass;
 	int status = 0;
+
+	/*
+	 * QoS can be disabled, or the qos replaced by bdev_qos_destroy(), while
+	 * this walk is in flight. Disabling clears BDEV_CH_QOS_ENABLED on this
+	 * thread before the qos is freed, so only touch the qos this walk was
+	 * started for, and only while the flag is still set.
+	 */
+	if (qos != ctx || (bdev_ch->flags & BDEV_CH_QOS_ENABLED) == 0) {
+		spdk_bdev_for_each_channel_continue(i, 0);
+		return;
+	}
+
+	pos = qos->iter_pos++;
+	in_pass = qos->iter_pass == 0 ? pos >= qos->rr_start : pos < qos->rr_start;
 
 	if (in_pass && !TAILQ_EMPTY(&bdev_ch->qos_queued_io)) {
 		if (bdev_qos_io_submit(bdev_ch, qos) > 0) {
@@ -4244,12 +4258,12 @@ bdev_channel_submit_qos_io(struct spdk_bdev_channel_iter *i, struct spdk_bdev *b
 static void
 bdev_channel_submit_qos_io_done(struct spdk_bdev *bdev, void *ctx, int status)
 {
-	struct spdk_bdev_qos *qos;
+	struct spdk_bdev_qos *qos = bdev->internal.qos;
 
-	if (bdev == NULL || bdev->internal.qos == NULL) {
+	/* The qos this walk was started for was disabled or replaced meanwhile. */
+	if (qos != ctx) {
 		return;
 	}
-	qos = bdev->internal.qos;
 
 	/* status 0: this pass visited every channel, so iter_pos is the channel count. */
 	if (status == 0) {
@@ -4850,6 +4864,8 @@ bdev_qos_destroy(struct spdk_bdev *bdev)
 	new_qos->ch = NULL;
 	new_qos->thread = NULL;
 	new_qos->poller = NULL;
+	/* A walk still in flight belongs to the old QoS and ignores this one. */
+	new_qos->busy = false;
 	/*
 	 * The limit member of spdk_bdev_qos_limit structure is not zeroed.
 	 * It will be used later for the new QoS structure.

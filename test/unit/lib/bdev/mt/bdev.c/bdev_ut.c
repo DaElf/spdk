@@ -1821,6 +1821,70 @@ qos_dynamic_enable_done(void *cb_arg, int status)
 	*rc = status;
 }
 
+/*
+ * The QoS poller's walk over the channels can still be in flight when QoS is
+ * disabled and the qos structure is freed. The walk must not touch the qos
+ * on a channel that the disable has already visited.
+ */
+static void
+qos_disable_during_walk(void)
+{
+	struct spdk_io_channel *io_ch[2];
+	struct spdk_bdev *bdev;
+	uint64_t limits[SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES] = {};
+	int status = -1;
+
+	setup_test();
+	MOCK_SET(spdk_get_ticks, 0);
+
+	bdev = &g_bdev.bdev;
+	bdev->internal.qos = calloc(1, sizeof(*bdev->internal.qos));
+	SPDK_CU_ASSERT_FATAL(bdev->internal.qos != NULL);
+	/* What spdk_bdev_set_qos_rate_limits() sets; 0 makes the timeslice loop spin. */
+	bdev->internal.qos->timeslice_in_usecs = SPDK_BDEV_QOS_TIMESLICE_IN_USEC;
+	bdev->internal.qos->rate_limits[SPDK_BDEV_QOS_RW_IOPS_RATE_LIMIT].limit = 1000;
+
+	g_get_io_channel = true;
+
+	/* Thread 0 owns the QoS poller. */
+	set_thread(0);
+	io_ch[0] = spdk_bdev_get_io_channel(g_desc);
+	set_thread(1);
+	io_ch[1] = spdk_bdev_get_io_channel(g_desc);
+	poll_threads();
+
+	/* Disable QoS from thread 2 and let the disable visit both channels. Its
+	 * completion is now queued to thread 2. */
+	set_thread(2);
+	spdk_bdev_set_qos_rate_limits(bdev, limits, 0, qos_dynamic_enable_done, &status);
+	poll_thread(0);
+	poll_thread(1);
+	CU_ASSERT(status == -1);
+
+	/* A timeslice expires: the poller starts a walk, which visits thread 0's
+	 * channel and is queued to thread 1. */
+	spdk_delay_us(SPDK_BDEV_QOS_TIMESLICE_IN_USEC);
+	poll_thread(0);
+
+	/* The disable completes and frees the qos on thread 0. */
+	poll_thread(2);
+	poll_thread(0);
+	CU_ASSERT(bdev->internal.qos == NULL);
+
+	/* The walk reaches thread 1's channel after the qos is gone. */
+	poll_thread(1);
+	poll_threads();
+	CU_ASSERT(status == 0);
+
+	set_thread(1);
+	spdk_put_io_channel(io_ch[1]);
+	set_thread(0);
+	spdk_put_io_channel(io_ch[0]);
+	poll_threads();
+
+	teardown_test();
+}
+
 static void
 qos_dynamic_enable(void)
 {
@@ -3101,6 +3165,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, enomem_multi_io_target);
 	CU_ADD_TEST(suite, enomem_retry_during_abort);
 	CU_ADD_TEST(suite, qos_dynamic_enable);
+	CU_ADD_TEST(suite, qos_disable_during_walk);
 	CU_ADD_TEST(suite, bdev_histograms_mt);
 	CU_ADD_TEST(suite, bdev_set_io_timeout_mt);
 	CU_ADD_TEST(suite, lock_lba_range_then_submit_io);
