@@ -1245,6 +1245,22 @@ nvmf_tcp_qpair_write_failed(struct spdk_nvmf_tcp_qpair *tqpair)
 	tqpair->group->num_write_err++;
 }
 
+/* Drop the write_err mark. The count only decides whether nvmf_tcp_poll_group_poll()
+ * looks for marked qpairs, so never let it wrap. */
+static void
+nvmf_tcp_qpair_clear_write_err(struct spdk_nvmf_tcp_poll_group *tgroup,
+			       struct spdk_nvmf_tcp_qpair *tqpair)
+{
+	if (!tqpair->write_err) {
+		return;
+	}
+
+	tqpair->write_err = false;
+	if (spdk_likely(tgroup->num_write_err > 0)) {
+		tgroup->num_write_err--;
+	}
+}
+
 static void
 _mgmt_pdu_write_done(void *_tqpair, int err)
 {
@@ -3587,11 +3603,7 @@ nvmf_tcp_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 	assert(tqpair->group == tgroup);
 
 	SPDK_DEBUGLOG(nvmf_tcp, "remove tqpair=%p from the tgroup=%p\n", tqpair, tgroup);
-	if (tqpair->write_err) {
-		tqpair->write_err = false;
-		assert(tgroup->num_write_err > 0);
-		tgroup->num_write_err--;
-	}
+	nvmf_tcp_qpair_clear_write_err(tgroup, tqpair);
 	if (tqpair->recv_state == NVME_TCP_PDU_RECV_STATE_AWAIT_REQ) {
 		/* Change the state to move the qpair from the await_req list to the main list
 		 * and prevent adding it again later by nvmf_tcp_qpair_set_recv_state() */
@@ -3691,11 +3703,12 @@ nvmf_tcp_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			    tqpair->recv_state == NVME_TCP_PDU_RECV_STATE_QUIESCING) {
 				nvmf_tcp_qpair_process(tqpair);
 			}
-			/* Keep retrying while PDUs are still being received into this qpair */
+			/* Disconnecting can remove the qpair from the group right away, and
+			 * nvmf_tcp_poll_group_remove() then already dropped the mark. Otherwise
+			 * keep retrying while PDUs are still being received into this qpair. */
 			if (tqpair->state > NVMF_TCP_QPAIR_STATE_RUNNING ||
 			    tqpair->recv_state != NVME_TCP_PDU_RECV_STATE_QUIESCING) {
-				tqpair->write_err = false;
-				tgroup->num_write_err--;
+				nvmf_tcp_qpair_clear_write_err(tgroup, tqpair);
 			}
 		}
 	}
